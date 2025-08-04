@@ -7,7 +7,7 @@ import {
   type InsertGameStreak,
   type VrfProof,
   type InsertVrfProof
-} from "@shared/schema";
+} from "client/api/schema";
 import { randomUUID } from "crypto";
 
 export interface IStorage {

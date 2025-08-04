@@ -1,5 +1,5 @@
 import { PublicKey } from "@solana/web3.js";
-import { proovNetworkVRF } from "./proovNetwork";
+import { proovNetworkVRF } from "../../client/api/proovNetwork";
 import { storage } from "server/storage";
 
 interface VRFResult {
