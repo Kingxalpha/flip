@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: hsl(240, 10%, 3.9%);
+  --foreground: hsl(0, 0%, 98%);
+  --muted: hsl(240, 3.7%, 15.9%);
+  --muted-foreground: hsl(240, 5%, 64.9%);
+  --popover: hsl(240, 10%, 3.9%);
+  --popover-foreground: hsl(0, 0%, 98%);
+  --card: hsl(240, 10%, 3.9%);
+  --card-foreground: hsl(0, 0%, 98%);
+  --border: hsl(240, 3.7%, 15.9%);
+  --input: hsl(240, 3.7%, 15.9%);
+  --primary: hsl(207, 90%, 54%);
+  --primary-foreground: hsl(211, 100%, 99%);
+  --secondary: hsl(240, 3.7%, 15.9%);
+  --secondary-foreground: hsl(0, 0%, 98%);
+  --accent: hsl(240, 3.7%, 15.9%);
+  --accent-foreground: hsl(0, 0%, 98%);
+  --destructive: hsl(0, 62.8%, 30.6%);
+  --destructive-foreground: hsl(0, 0%, 98%);
+  --ring: hsl(240, 4.9%, 83.9%);
+  --radius: 0.5rem;
+  
+  /* Custom colors for the game */
+  --stake-blue: hsl(217, 53%, 16%);
+  --stake-dark: hsl(221, 39%, 11%);
+  --coin-orange: hsl(18, 100%, 60%);
+  --coin-blue: hsl(207, 90%, 54%);
+  --neon-green: hsl(142, 76%, 58%);
+  --neon-red: hsl(0, 79%, 70%);
+  --text-gray: hsl(210, 17%, 92%);
+  --game-gradient: linear-gradient(135deg, hsl(221, 39%, 11%), hsl(217, 53%, 16%), hsl(221, 39%, 11%));
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+    background: var(--game-gradient);
+    min-height: 100vh;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+}
+
+@layer components {
+  .stake-blue {
+    background-color: var(--stake-blue);
+  }
+  
+  .stake-dark {
+    background-color: var(--stake-dark);
+  }
+  
+  .coin-orange {
+    background-color: var(--coin-orange);
+  }
+  
+  .coin-blue {
+    background-color: var(--coin-blue);
+  }
+  
+  .neon-green {
+    color: var(--neon-green);
+  }
+  
+  .neon-red {
+    color: var(--neon-red);
+  }
+  
+  .text-gray {
+    color: var(--text-gray);
+  }
+}
+
+@layer utilities {
+  .coin-shadow {
+    filter: drop-shadow(0 10px 20px rgba(0, 0, 0, 0.5));
+  }
+  
+  .neon-border {
+    border: 2px solid transparent;
+    background: linear-gradient(45deg, var(--coin-orange), var(--coin-blue)) border-box;
+    -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: exclude;
+  }
+}
+
+@keyframes coinFlip {
+  0% { transform: rotateY(0deg) scale(1); }
+  50% { transform: rotateY(180deg) scale(1.1); }
+  100% { transform: rotateY(360deg) scale(1); }
+}
+
+@keyframes glow {
+  from { box-shadow: 0 0 20px rgba(81, 207, 102, 0.5); }
+  to { box-shadow: 0 0 30px rgba(81, 207, 102, 0.8), 0 0 40px rgba(81, 207, 102, 0.3); }
+}
+
+@keyframes pulseNeon {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.animate-coin-flip {
+  animation: coinFlip 1s ease-in-out;
+}
+
+.animate-glow {
+  animation: glow 2s ease-in-out infinite alternate;
+}
+
+.animate-pulse-neon {
+  animation: pulseNeon 1.5s ease-in-out infinite;
+}

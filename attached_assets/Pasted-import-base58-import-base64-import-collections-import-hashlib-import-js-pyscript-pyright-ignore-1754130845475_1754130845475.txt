@@ -1,0 +1,712 @@
+import base58
+import base64
+import collections
+import hashlib
+import js, pyscript  # pyright: ignore
+import json
+import math
+import nacl.exceptions
+import nacl.signing
+import typing
+from urllib.parse import urlparse
+from nacl.bindings import (
+    crypto_core_ed25519_add,
+    crypto_core_ed25519_sub,
+    crypto_scalarmult_ed25519_base_noclamp,
+    crypto_scalarmult_ed25519_noclamp,
+)
+
+# ecvrf_ed25519_tai_verify.py
+SUITE_ID      = b"\x03"           # ECVRF‑ED25519‑SHA512‑TAI suite id
+POINT_BYTES   = 32
+INTERMEDIATE  = 16
+PROOF_BYTES   = 80                # 32 (Γ) + 16 (c) + 32 (s)
+_ID           = b"\x00" * 32
+
+
+def _mul_by_cofactor(p: bytes) -> bytes:
+    r = p
+    for _ in range(3):
+        r = crypto_core_ed25519_add(r, r)
+    return r
+
+def _hash_to_curve_tai(pk: bytes, alpha: bytes) -> bytes:
+    for ctr in range(256):
+        h = hashlib.sha512()
+        h.update(SUITE_ID)        # suite
+        h.update(b"\x01")         # 0x01
+        h.update(pk)              # Y
+        h.update(alpha)           # message
+        h.update(bytes([ctr]))    # counter
+        h.update(b"\x00")         # 0x00
+        candidate = h.digest()[:POINT_BYTES]
+
+        try:
+            H = _mul_by_cofactor(candidate)
+            if H != _ID:
+                return H
+        except Exception:
+            pass
+    raise ValueError("hash_to_curve_tai: no valid point after 255 attempts")
+# ----------------------------------------------------------------------
+
+def _hash_points(*pts: bytes) -> bytes:
+    h = hashlib.sha512()
+    h.update(SUITE_ID + b"\x02")
+    for p in pts:
+        h.update(p)
+    h.update(b"\x00")
+    return h.digest()[:INTERMEDIATE]
+
+_COFACTOR_SCL = (8).to_bytes(32, "little")
+
+def _proof_to_hash(gamma: bytes) -> bytes:
+    gamma_c = crypto_scalarmult_ed25519_noclamp(_COFACTOR_SCL, gamma)
+    h = hashlib.sha512()
+    h.update(SUITE_ID + b"\x03" + gamma_c + b"\x00")
+    return h.digest()
+
+def verify_vrf(pk: bytes, msg: bytes, proof: bytes):
+    if len(pk) != 32:
+        raise ValueError("public key must be 32 bytes")
+    if len(proof) != PROOF_BYTES:
+        raise ValueError("proof must be 80 bytes")
+
+    gamma = proof[:32]
+    c16   = proof[32:48]
+    s     = proof[48:]
+
+    c32   = c16 + b"\x00" * 16                     # little‑endian
+    h     = _hash_to_curve_tai(pk, msg)
+
+    # U = s·B − c·Y
+    sB = crypto_scalarmult_ed25519_base_noclamp(s)
+    cY = crypto_scalarmult_ed25519_noclamp(c32, pk)
+    U  = crypto_core_ed25519_sub(sB, cY)
+
+    # V = s·H − c·Γ
+    sH = crypto_scalarmult_ed25519_noclamp(s, h)
+    cG = crypto_scalarmult_ed25519_noclamp(c32, gamma)
+    V  = crypto_core_ed25519_sub(sH, cG)
+
+    if _hash_points(h, gamma, U, V) != c16:
+        return False, b""
+
+    return True, _proof_to_hash(gamma)
+
+
+def extend_randomness_with_string(randomness: bytes, extension: str) -> bytes:
+    prehash = randomness + extension.encode()
+    return hashlib.sha256(prehash).digest()
+
+
+def extend_randomness_with_int(randomness: bytes, n: int) -> bytes:
+    return extend_randomness_with_string(randomness, f":{n}")
+
+
+def randomness_to_uniform_float(randomness: bytes) -> float:
+    x = int.from_bytes(randomness[:8], byteorder = "little")
+    x >>= 11
+    outcome = x / (1 << 53)
+    write_output({"random_float: ": outcome})
+    return outcome
+
+
+def randomness_to_uniform_int(randomness: bytes, range_size: int) -> int:
+    outcome = int.from_bytes(randomness) % range_size
+    write_output({"random_int: ": outcome})
+    return outcome
+
+
+def simulate_coinflip(bet: int, edge: float, randomness: bytes, k: int, n: int) -> int:
+    total_probability = 0.0
+    for x in range(k, n + 1):
+        total_probability += 0.5**n * math.factorial(n) / (math.factorial(x) * math.factorial(n - x))
+    heads = 0
+    for i in range(n):
+        randomness_i = extend_randomness_with_int(randomness, i)
+        outcome = randomness_to_uniform_int(randomness_i, 2)
+        heads += outcome
+    if heads >= k:
+        win_multiplier = (1.0 / total_probability) * (1.0 - edge)
+        return math.floor(win_multiplier * bet)
+    else:
+        return 0
+
+
+def simulate_crash(bet: int, edge: float, randomness: bytes, target_multiplier: float) -> int:
+    x = randomness_to_uniform_float(randomness)
+    crash_multiplier = (1.0 - edge) / max(1e-9, x)
+    if crash_multiplier > target_multiplier:
+        return math.floor(target_multiplier * bet)
+    else:
+        return 0
+
+
+def simulate_diamonds(bet: int, randomness: bytes) -> int:
+    n_draws = 5
+    n_types = 7
+    draws = []
+    for i in range(n_draws):
+        randomness_i = extend_randomness_with_int(randomness, i)
+        draws.append(randomness_to_uniform_int(randomness_i, n_types))
+    counts = sorted(collections.Counter(draws).values())
+    multiplier = 0.0
+    if len(counts) == 4:
+        multiplier = 0.1
+    elif len(counts) == 3 and counts[2] == 3:
+        multiplier = 3.0
+    elif len(counts) == 3:
+        multiplier = 2.0
+    elif len(counts) == 2 and counts[1] == 4:
+        multiplier = 5.0
+    elif len(counts) == 2:
+        multiplier = 4.0
+    elif len(counts) == 1:
+        multiplier = 50.0
+    else:
+        pass
+    return math.floor(multiplier * bet)
+
+
+def simulate_dice(bet: int, edge: float, randomness: bytes, win_cutoff: int) -> int:
+    max_cutoff = 10**4
+    outcome = randomness_to_uniform_int(randomness, max_cutoff)
+    if outcome < win_cutoff:
+        win_multiplier = (1.0 - edge) * max_cutoff / win_cutoff
+        return math.floor(win_multiplier * bet)
+    else:
+        return 0
+
+
+def simulate_eslot(bet: int, distribution: dict, distribution_weights: dict[str,int], randomness: bytes) -> int:
+    total_weight = sum(distribution_weights.values())
+    outcome = randomness_to_uniform_int(randomness, total_weight)
+    current_outcome = 0
+    for (multiplier, weight) in sorted((int(x), y) for (x, y) in distribution_weights.items()):
+        current_outcome += weight
+        if current_outcome > outcome:
+            return math.floor(multiplier / distribution["bet_multiplier"] * bet)
+    return -1
+
+
+def simulate_furyroad(bet: int, edge: float, randomness: bytes, close_step: int, step_multiplier: int) -> int:
+    if close_step == 0:
+        return 0
+    for i in range(2, close_step + 2):
+        crossover_probability = 1.0 / (step_multiplier / 1e2)
+        if i == 1:
+            crossover_probability *= (1.0 - edge)
+        randomness_i = extend_randomness_with_int(randomness, i)
+        crossed = crossover_probability > randomness_to_uniform_float(randomness_i)
+        if not crossed:
+            return 0
+    multiplier = (step_multiplier / 1e2) ** close_step
+    return math.floor(multiplier * bet)
+
+
+def simulate_hellspin(bet: int, edge: float, randomness: bytes, targets: dict[str, int]) -> int:
+    parsed_targets: dict[float, int] = collections.defaultdict(int)
+    total_weight = 0
+    for (target_str, weight) in targets.items():
+        target = round(float(target_str) * 1e2) / 1e2
+        parsed_targets[target] += weight
+        total_weight += weight
+    outcome = randomness_to_uniform_float(randomness)
+    multiplier = (1.0 - edge) / max(1e-9, outcome)
+    win = 0
+    for (target, weight) in parsed_targets.items():
+        if multiplier >= target:
+            win += math.floor(target * bet * (weight / total_weight))
+    return win
+
+
+def simulate_jackpot(bet: int, edge: float, randomness: bytes, balance_address: str, nonce: int, stakes: list[dict]) -> int:
+    total_levered_cents = sum(x["total_cents"] for x in stakes)
+    payout_cents = math.floor(total_levered_cents * (1.0 - edge))
+    outcome = randomness_to_uniform_int(randomness, total_levered_cents)
+    current_outcome = 0
+    for stake in stakes:
+        current_outcome += stake["total_cents"]
+        if current_outcome > outcome:
+            if stake["balance_address"] == balance_address and stake["nonce"] == nonce:
+                return math.floor(bet * payout_cents / stake["total_cents"])
+            else:
+                return 0
+    return -1
+
+
+def simulate_keno(bet: int, config: dict, randomness: bytes, picks: list[int], risk_level: str) -> int:
+    n_pool = 40
+    pool = [x + 1 for x in range(n_pool)]
+    for i in range(n_pool - 1):
+        randomness_i = extend_randomness_with_int(randomness, i)
+        j = i + randomness_to_uniform_int(randomness_i, n_pool - i)
+        pool[i], pool[j] = pool[j], pool[i]
+    wins = sum(x in pool[:10] for x in picks)
+    multiplier = config[risk_level][len(picks) - 1][wins]
+    return math.floor(multiplier * bet)
+
+
+def simulate_limbo(bet: int, edge: float, randomness: bytes, target_multiplier: float) -> int:
+    x = randomness_to_uniform_float(randomness)
+    limbo_multiplier = (1.0 - edge) / max(1e-9, x)
+    if limbo_multiplier > target_multiplier:
+        return math.floor(target_multiplier * bet)
+    else:
+        return 0
+
+
+def simulate_mines(bet: int, edge: float, randomness: bytes, grid_size: int, mines: int, reveals: list[int]) -> int:
+    possible_mine_ixs = list(range(grid_size))
+    mine_ixs = set()
+    for i in range(mines):
+        randomness_i = extend_randomness_with_int(randomness, i)
+        j = randomness_to_uniform_int(randomness_i, len(possible_mine_ixs))
+        mine_ix_i = possible_mine_ixs.pop(j)
+        mine_ixs.add(mine_ix_i)
+    win_multiplier = 1.0
+    for (i, reveal_ix_i) in enumerate(reveals):
+        if reveal_ix_i in mine_ixs:
+            return 0
+        loss_probability = mines / (grid_size - i)
+        win_multiplier *= 1.0 / (1.0 - loss_probability)
+    return math.floor(win_multiplier * (1.0 - edge) * bet)
+
+
+def simulate_plinko(bet: int, config: dict, randomness: bytes, board_name: str) -> int:
+    multipliers = [x["multipliers"] for x in config if x["name"] == board_name][0]
+    position = 0
+    for i in range(len(multipliers) - 1):
+        randomness_i = extend_randomness_with_int(randomness, i)
+        position += randomness_to_uniform_int(randomness_i, 2)
+    return math.floor(multipliers[position] * bet)
+
+
+def simulate_roulette(bet: int, randomness: bytes, bets: dict[str, int]) -> int:
+    red_numbers = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+    outcome = randomness_to_uniform_int(randomness, 37)
+    payout = 0
+    total_amount = 0
+    for (name, amount) in bets.items():
+        total_amount += amount
+        if outcome == 0 and name != "0":
+            continue
+        match name:
+            case "odd":
+                if outcome % 2 == 1:
+                    payout += 2 * amount
+            case "even":
+                if outcome % 2 == 0:
+                    payout += 2 * amount
+            case "red":
+                if outcome in red_numbers:
+                    payout += 2 * amount
+            case "black":
+                if outcome not in red_numbers:
+                    payout += 2 * amount
+            case "1to18":
+                if outcome <= 18:
+                    payout += 2 * amount
+            case "19to36":
+                if outcome >= 19:
+                    payout += 2 * amount
+            case "1to12":
+                if outcome <= 12:
+                    payout += 3 * amount
+            case "13to24":
+                if outcome >= 13 and outcome <= 24:
+                    payout += 3 * amount
+            case "25to36":
+                if outcome >= 25:
+                    payout += 3 * amount
+            case "column1":
+                if outcome % 3 == 1:
+                    payout += 3 * amount
+            case "column2":
+                if outcome % 3 == 2:
+                    payout += 3 * amount
+            case "column3":
+                if outcome % 3 == 0:
+                    payout += 3 * amount
+            case _:
+                if outcome == int(name):
+                    payout += 36 * amount
+    multiplier = payout / total_amount
+    return math.floor(multiplier * bet)
+
+
+def simulate_tower(bet: int, edge: float, randomness: bytes, actives: int, picks: list[int], width: int) -> int:
+    multiplier = 1.0 - edge
+    for (step, pick) in enumerate(picks, start = 1):
+        ix_pool = list(range(width))
+        is_safe = False
+        for i in range(actives):
+            randomness_i = extend_randomness_with_string(randomness, f"{step}:{i}")
+            j = randomness_to_uniform_int(randomness_i, len(ix_pool))
+            if ix_pool[j] == pick:
+                is_safe = True
+            ix_pool = ix_pool[:j] + ix_pool[j+1:]
+        if is_safe:
+            multiplier = (width / actives)**step * (1.0 - edge)
+        else:
+            return 0
+    return math.floor(multiplier * bet)
+
+
+def bet_randomness(bet: dict) -> bytes:
+    proof = base58.b58decode(bet["proof"])
+    return hashlib.sha256(proof).digest()
+
+
+def verify_signature(public_key_base58: str, msg: str, signature: bytes) -> bool:
+    pk_bytes = base58.b58decode(public_key_base58)
+    pk = nacl.signing.VerifyKey(pk_bytes)
+    msg_bytes = msg.encode()
+    verified = False
+    try:
+        verified = pk.verify(msg_bytes, signature) == msg_bytes
+    except nacl.exceptions.BadSignatureError:
+        pass
+    write_output("Checking message signature:")
+    write_output({
+        "msg": msg,
+        "public_key": public_key_base58,
+        "signature": signature.hex(),
+        })
+    return verified
+
+def verify_proof(public_key_base58: str,msg: str,proof: bytes) -> bool:
+    status, beta = verify_vrf(base58.b58decode(public_key_base58), msg.encode(), proof)
+    return status
+
+def verify_login_signature(login_msg: str, signature_base64: str, wallet_address: str) -> bool:
+    signature = base64.b64decode(signature_base64)
+    verified = verify_signature(wallet_address, login_msg, signature)
+    write_output(f"1. Check that the login message (containing authentication key) is signed by wallet: {verified}")
+    js.setVerifyStatus(1, verified)
+    return verified
+
+
+def verify_bet_request_signature(combined_signature_base58: str, public_key_base58: str, request_body_base58: str) -> bool:
+    combined_signature = base58.b58decode(combined_signature_base58)
+    nonce_time = int.from_bytes(combined_signature[32:40], byteorder="little")
+    signature = combined_signature[40:]
+    msg_bytes = base58.b58decode(request_body_base58)
+    combined_msg = msg_bytes.decode() + str(nonce_time)
+    verified = verify_signature(public_key_base58, combined_msg, signature)
+    write_output(f"2. Check that the bet request is signed by the authentication key: {verified}")
+    js.setVerifyStatus(2, verified)
+    return verified
+
+
+def verify_randomness(bet: dict, signers: list[str]) -> bool:
+    proof = base58.b58decode(bet["proof"])
+    nonce = str(bet["nonce"])
+    request = base58.b58decode(bet["request_body"])
+    params = base58.b58encode(hashlib.sha256(request).digest()).decode()
+    msg = "PROOV:" + bet["address"] + ":" + nonce + ":" + params
+    verified = True
+    if len(signers) * 64 == len(proof):
+        for (i, signer) in enumerate(signers):
+            signature_i = proof[i * 64:(i + 1) * 64]
+            if not verify_signature(signer, msg, signature_i):
+                verified = False
+    elif len(signers) * 80 == len(proof):
+        for (i, signer) in enumerate(signers):
+            signature_i = proof[i * 80:(i + 1) * 80]
+            if not verify_proof(signer, msg, signature_i):
+                verified = False
+    else:
+        verified = False
+    write_output(f"3. Check that the randomness value was correctly generated by the oracles: {verified}")
+    js.setVerifyStatus(3, verified)
+    return verified
+
+
+def verify_bet_payout(bet: dict, distribution: dict, extra_data: dict) -> bool:
+    bet_amount = bet["raw_bet"]
+    win_amount = bet["raw_win"]
+    edge = distribution["edge"]
+    randomness = bet_randomness(bet)
+    p = bet["bet_params"]
+    match bet["game_name"]:
+        case "coinflip":
+            k = p["k"]
+            n = p["n"]
+            simulated_win_amount = simulate_coinflip(bet_amount, edge, randomness, k, n)
+        case "crash":
+            reason = p["reason"]
+            if reason == "user" and win_amount != 0:
+                # The target_multiplier for user-closed bets depends on their exact timing, so it must be estimated.
+                target_multiplier = win_amount / bet_amount + 1e-10
+            else:
+                target_multiplier = p["target"]
+            simulated_win_amount = simulate_crash(bet_amount, edge, randomness, target_multiplier)
+        case "diamonds":
+            simulated_win_amount = simulate_diamonds(bet_amount, randomness)
+        case "dice":
+            win_cutoff = p["cutoff"]
+            simulated_win_amount = simulate_dice(bet_amount, edge, randomness, win_cutoff)
+        case "furyroad":
+            close_step = p["step"]
+            step_multiplier = p["step_multiplier"]
+            simulated_win_amount = simulate_furyroad(bet_amount, edge, randomness, close_step, step_multiplier)
+        case "hellspin":
+            targets = p["targets"]
+            simulated_win_amount = simulate_hellspin(bet_amount, edge, randomness, targets)
+        case "jackpot":
+            balance_address = bet["address"]
+            nonce = bet["nonce"]
+            stakes = extra_data["jackpot"]["stakes"]
+            simulated_win_amount = simulate_jackpot(bet_amount, edge, randomness, balance_address, nonce, stakes)
+        case "keno":
+            config = distribution["config"]
+            picks = p["picks"]
+            risk = p["risk"]
+            simulated_win_amount = simulate_keno(bet_amount, config, randomness, picks, risk)
+        case "limbo":
+            target = p["target"]
+            simulated_win_amount = simulate_limbo(bet_amount, edge, randomness, target)
+        case "mines":
+            grid_size = p["height"] * p["width"]
+            mines = p["mines"]
+            reveals = p["reveals"] or []
+            simulated_win_amount = simulate_mines(bet_amount, edge, randomness, grid_size, mines, reveals)
+        case "plinko":
+            board_name = p["board"]
+            config = distribution["config"]
+            simulated_win_amount = simulate_plinko(bet_amount, config, randomness, board_name)
+        case "roulette":
+            bets = p["bets"]
+            simulated_win_amount = simulate_roulette(bet_amount, randomness, bets)
+        case "tower":
+            actives = p["actives"]
+            picks = p["picks"] or []
+            width = p["width"]
+            simulated_win_amount = simulate_tower(bet_amount, edge, randomness, actives, picks, width)
+        case _:
+            if distribution["frontend_type"] == "eslot":
+                simulated_win_amount = simulate_eslot(bet_amount, distribution, extra_data["distribution_weights"], randomness)
+            else:
+                write_output("Unknown game.")
+                simulated_win_amount = -1
+    write_output(f"Simulated bet payout: {simulated_win_amount}")
+    verified = win_amount == simulated_win_amount
+    write_output(f"4. Check that the bet's payout is correct: {verified}")
+    js.setVerifyStatus(4, verified)
+    return verified
+
+
+def verify_shard(bet: dict, edge: float) -> bool:
+    prize_levels = [1, 1.1, 1.3, 1.5, 1.7, 2, 2.3, 2.7, 3.1, 3.5, 4, 4.6, 5.3, 6.1, 7.1, 8.1, 9.3, 11, 12, 14, 16, 19, 22, 25, 28, 33, 38, 43, 50, 57, 66, 76, 87, 100, 110, 130, 150, 170, 200, 230, 270, 310, 350, 400, 460, 530, 610, 710, 810, 930, 1100, 1200, 1400, 1600, 1900, 2200, 2500, 2800, 3300, 3800, 4300, 5000, 5700, 6600, 7600, 8700, 10000, 11000, 13000, 15000, 17000, 20000, 23000, 27000, 31000, 35000, 40000, 46000, 53000, 61000, 71000, 81000, 93000, 110000, 120000, 140000, 160000, 190000, 220000, 250000, 280000, 330000, 380000, 430000, 500000, 570000, 660000, 760000, 870000, 1000000]
+    shard_ev_fraction = bet["shard_rate"]
+    shards_per_prize = 5
+
+    shard_ev = shard_ev_fraction * edge * bet["dollar_bet"]
+    first_prize = bet["shard_from"]
+    last_prize = bet["shard_to"]
+    total_prizes = 1 + last_prize - first_prize
+
+    randomness_shard = extend_randomness_with_string(bet_randomness(bet), ":shard")
+    shard_outcome = randomness_to_uniform_float(randomness_shard)
+
+    current_probability = 0.0
+    shard_won = -1
+    for i in range(first_prize, last_prize + 1):
+        current_probability += shards_per_prize * (shard_ev / prize_levels[i]) / total_prizes
+        if current_probability > shard_outcome:
+            shard_won = i
+            break
+    write_output(f"Simulated shard won: {shard_won if shard_won != -1 else None}")
+
+    if "shard_won" in bet:
+        verified = bet["shard_won"] == shard_won
+    else:
+        verified = shard_won == -1
+    write_output(f"5. Check that the shard award is correct: {verified}")
+    js.setVerifyStatus(5, verified)
+    return verified
+
+
+def verify_settlement(bets: list[dict], settlement: dict) -> bool:
+    total_bet = sum(x["raw_bet"] for x in bets)
+    total_win = sum(x["raw_win"] for x in bets)
+    write_output(f'Total wagered amount from bets: {total_bet}, from settlement: {settlement["wagered"]}')
+    write_output(f'Total win amount from bets: {total_win}, from settlement: {settlement["won"]}')
+    verified = total_bet == settlement["wagered"] and total_win == settlement["won"]
+    write_output(f"6. Check that the bet's settlement values are correct: {verified}")
+    js.setVerifyStatus(6, verified)
+    return verified
+
+
+def verify_solana_tx(settlement: dict, tx: dict) -> bool:
+    settlement_balance_delta = settlement["won"] - settlement["wagered"]
+    write_output(f"Settlement balance delta: {settlement_balance_delta}")
+    tx_accounts = tx["result"]["transaction"]["message"]["accountKeys"]
+    tx_balance_ix = tx_accounts.index(settlement["address"])
+    balance_pre = [x for x in tx["result"]["meta"]["preTokenBalances"] if x["accountIndex"] == tx_balance_ix][0]
+    balance_post = [x for x in tx["result"]["meta"]["postTokenBalances"] if x["accountIndex"] == tx_balance_ix][0]
+    tx_balance_delta = int(balance_post["uiTokenAmount"]["amount"]) - int(balance_pre["uiTokenAmount"]["amount"])
+    write_output(f"Solana tx balance delta: {tx_balance_delta}")
+    verified = settlement_balance_delta == tx_balance_delta
+    write_output(f"7. Check that the settlement values match the on-chain transaction values: {verified}")
+    js.setVerifyStatus(7, verified)
+    return verified
+
+
+async def get_url(url: str, verbose: bool = True) -> typing.Any:
+    write_output(f"Fetching from {url}:")
+    r = await pyscript.fetch(url, method = "GET").json()
+    if verbose:
+        write_output(r)
+    return r
+
+
+async def get_bet(balance_address: str, nonce: int) -> dict:
+    url = f"{api_base_url}/solana/bets/{balance_address}/{nonce}"
+    return await get_url(url)
+
+
+async def get_distribution_weights(distribution_id: int) -> dict:
+    url = f"{api_base_url}/games/distributions/{distribution_id}"
+    return await get_url(url)
+
+
+async def get_distributions() -> list[dict]:
+    url = f"{api_base_url}/games/distributions"
+    return await get_url(url, verbose = False)
+
+
+# 1806, 1805, 1804, 1797, 1778
+async def get_jackpot(jackpot_id: int) -> dict:
+    url = f"{api_base_url}/solana/jackpot/{jackpot_id}"
+    return await get_url(url)
+
+
+async def get_and_verify_jackpot_block_hashes(jackpot: dict, signers: list[str]) -> list[str]:
+    first_block = int(jackpot["jackpot"]["first_block"])
+    block_count = int(jackpot["jackpot"]["block_count"])
+    signatures = base58.b58decode(jackpot["jackpot"]["randomness"])
+    hashes = []
+    for i in range(block_count):
+        block = await get_solana_block(first_block + i)
+        block_hash = block["result"]["blockhash"]
+        signing_msg = "BLOCK:" + block_hash
+        for (j, signer) in enumerate(signers):
+            sig_ix0 = 64 * (i * len(signers) + j)
+            signature = signatures[sig_ix0:sig_ix0 + 64]
+            if not verify_signature(signer, signing_msg, signature):
+                return []
+        hashes.append(hash)
+    return hashes
+
+
+async def get_login(public_key: str) -> dict:
+    url = f"{api_base_url}/solana/login/key/{public_key}"
+    return await get_url(url)
+
+
+async def get_settlement_bets(balance_address: str, settlement: int) -> list[dict]:
+    url = f"{api_base_url}/solana/bets/settlement/{balance_address}/{settlement}"
+    return await get_url(url)
+
+
+async def get_settlement(balance_address: str, settlement: int) -> dict:
+    url = f"{api_base_url}/solana/settlements/{balance_address}/{settlement}"
+    return await get_url(url)
+
+
+async def get_signers() -> list[str]:
+    url = f"{api_base_url}/solana/signers"
+    return await get_url(url)
+
+
+async def get_solana_rpc(method: str, params: list) -> dict:
+    data = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+            }
+    headers = {
+            "Content-Type": "application/json",
+            }
+    write_output(f"Fetching from {solana_rpc_url} with {data}:")
+    r = await pyscript.fetch(solana_rpc_url, body = json.dumps(data), headers = headers, method = "POST").json()
+    write_output(r)
+    return r
+
+
+async def get_solana_block(block: int) -> dict:
+    return await get_solana_rpc("getBlock", [block, {"encoding": "json", "transactionDetails": "none", "rewards": False}])
+
+
+async def get_solana_tx(txid: str) -> dict:
+    return await get_solana_rpc("getTransaction", [txid, "json"])
+
+
+def find_game_distribution(distribution_id: str, distributions: list[dict]) -> dict:
+    write_output(f"Finding game distribution with id {distribution_id}:")
+    d = [x for x in distributions if x["distribution_id"] == distribution_id][0]
+    write_output(d)
+    return d
+
+
+def write_output(x):
+    if type(x) == str:
+        x = ">>> " + x
+    else:
+        max_lines = 500
+        lines = json.dumps(x, indent = 2).split("\n")
+        n_lines = len(lines)
+        if n_lines > max_lines:
+            lines = lines[:max_lines]
+            lines.append(f"({n_lines - max_lines} lines omitted)")
+        x = pyscript.HTML("<span class='output-grey'>" + "\n".join(lines) + "</span>")
+    pyscript.display(x, target="output")
+    pyscript.display("\n", target="output")
+
+api_base_url = f"{(p:=urlparse(js.window.location.href)).scheme}://{('rpc1' if (h:=p.hostname).endswith('.network') else 'api')}.{'.'.join(h.split('.')[-2:])}"
+solana_rpc_url = "https://solana-rpc.publicnode.com" if ((d := urlparse(js.window.location.href).hostname).endswith('.com') or d.endswith('.network')) else "https://api.devnet.solana.com"
+
+async def pyscript_main(_):
+    balance_address = js.document.getElementById("balanceAddressInput").value
+    nonce_raw = js.document.getElementById("nonceInput").value
+    try:
+        nonce = int(nonce_raw) if nonce_raw not in ("", None, "undefined") else None
+    except (TypeError, ValueError):
+        nonce = None
+    if balance_address is None or balance_address in ["", "undefined"] or nonce is None:
+        write_output("Please provide balance address and nonce to verify.")
+        return
+
+    extra_data = {}
+    bet = await get_bet(balance_address, nonce)
+    distributions = await get_distributions()
+    distribution = find_game_distribution(bet["distribution_id"], distributions)
+    if distribution["frontend_type"] == "eslot":
+        extra_data["distribution_weights"] = await get_distribution_weights(bet["distribution_id"])
+    login = await get_login(bet["user_key"])
+    verify_login_signature(login["signed_message"], login["signature"], login["address"])
+    verify_bet_request_signature(bet["request_signature"], bet["user_key"], bet["request_body"])
+    signers = await get_signers()
+    verify_randomness(bet, signers)
+    if bet["game_name"] == "jackpot":
+        extra_data["jackpot"] = await get_jackpot(bet["bet_params"]["jackpot_id"])
+        extra_data["jackpot_block_hashes"] = await get_and_verify_jackpot_block_hashes(extra_data["jackpot"], signers)
+    verify_bet_payout(bet, distribution, extra_data)
+    verify_shard(bet, distribution["edge"])
+    if bet["settlement"] != 0:
+        settlement = await get_settlement(balance_address, bet["settlement"])
+        settlement_bets = await get_settlement_bets(balance_address, bet["settlement"])
+        verify_settlement(settlement_bets, settlement)
+        if "txid" in settlement:
+            tx = await get_solana_tx(settlement["txid"])
+            if tx["result"]:
+                verify_solana_tx(settlement, tx)
+                write_output("Finished.")
+            else:
+                write_output("txid not found.  For older transactions, try searching on a Solana archive node.")
+    else:
+        write_output("Bet not yet settled.")
